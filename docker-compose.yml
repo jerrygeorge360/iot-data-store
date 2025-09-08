@@ -1,0 +1,72 @@
+version: "3.9"
+
+services:
+  fastapi-app:
+    build: .
+    container_name: fastapi-service
+    restart: always
+    environment:
+      # MQTT config
+      MQTT_BROKER: mosquitto
+      MQTT_PORT: 1883
+
+      # Database config (Local Postgres)
+      POSTGRESQL_URI: postgresql+psycopg2://postgres:postgres@postgres:5432/mydb
+      POSTGRESQL_HOST: postgres
+      POSTGRESQL_PORT: 5432
+      POSTGRESQL_USER: postgres
+      POSTGRESQL_PASSWORD: postgres
+      POSTGRESQL_DBNAME: mydb
+
+    depends_on:
+      - mosquitto
+      - postgres
+    ports:
+      - "8000:8000"
+
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: mosquitto-broker
+    restart: always
+    ports:
+      - "1884:1883"  # Container 1883 exposed on host 1884
+      - "9001:9001"
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    restart: always
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    restart: always
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+
+  postgres:
+    image: postgres:15
+    container_name: postgres
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: mydb
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:
