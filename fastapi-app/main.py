@@ -1,7 +1,7 @@
 import os
 import json
 import threading
-from fastapi import FastAPI, Depends, Request
+from fastapi import FastAPI, Depends, Request,Response
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings
 from sqlalchemy import create_engine, Column, Integer, Float, String,BigInteger,DateTime,func
@@ -212,4 +212,4 @@ def get_status(db: Session = Depends(get_db)):
 @app.get("/metrics")
 def metrics():
     """Prometheus scrape endpoint"""
-    return generate_latest(), 200, {"Content-Type": CONTENT_TYPE_LATEST}
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
