@@ -2,21 +2,18 @@ import os
 import json
 import threading
 from datetime import datetime
-from fastapi import FastAPI, Depends, Request, Response
+from fastapi import FastAPI, Depends, Request, Response, HTTPException
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings
-from sqlalchemy import create_engine, Column, Integer, Float, String, BigInteger, DateTime, func
+from sqlalchemy import create_engine, Column, Integer, Float, String, BigInteger, DateTime, Boolean, func
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 import paho.mqtt.client as mqtt
-
-# Prometheus client
 from prometheus_client import Counter, Gauge, generate_latest, CONTENT_TYPE_LATEST
 
 
 class Settings(BaseSettings):
     # Database settings
-    POSTGRESQL_URI: str = ""
     POSTGRESQL_HOST: str
     POSTGRESQL_PORT: str
     POSTGRESQL_USER: str
@@ -34,7 +31,11 @@ class Settings(BaseSettings):
 settings = Settings()
 
 # FastAPI Setup
-app = FastAPI(title="IoT Sensor Data API", version="1.0.0")
+app = FastAPI(
+    title="Unified Solar Still Monitoring API",
+    version="2.0.0",
+    description="Supports both conventional and automated solar still systems"
+)
 
 # Database Setup
 DATABASE_URL = f"postgresql+psycopg2://{settings.POSTGRESQL_USER}:{settings.POSTGRESQL_PASSWORD}@{settings.POSTGRESQL_HOST}:{settings.POSTGRESQL_PORT}/{settings.POSTGRESQL_DBNAME}"
@@ -51,17 +52,33 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 
-# Enhanced Database model with temp1 and temp2
-class SensorData(Base):
-    __tablename__ = "pyranometer"
+# Unified Database Model
+class SolarStillData(Base):
+    __tablename__ = "solar_still_data"
 
     id = Column(BigInteger, primary_key=True, index=True)
+
+    # System identification
+    system_type = Column(String, nullable=False, index=True)  # "conventional" or "automated"
+
+    # Temperature data
     temperature = Column(Float, nullable=False)  # Average temperature
-    light_intensity = Column(Float, nullable=False)
+    temp1 = Column(Float, nullable=True)  # T1 (Thermistor 1)
+    temp2 = Column(Float, nullable=True)  # T2 (Thermistor 2)
+    temp3 = Column(Float, nullable=True)  # T3 (Thermistor 3)
+    temp4 = Column(Float, nullable=True)  # T4 (Thermistor 4)
+    temp5 = Column(Float, nullable=True)  # T5 (Thermistor 5)
+
+    # Water level data
+    water_depth_cm = Column(Float, nullable=False)
+    water_raw_adc = Column(Integer, nullable=True)
+
+    # Pump status (only for automated systems)
+    pump_status = Column(String, nullable=True)  # "ON", "OFF", or null for conventional
+
+    # Timestamps
     time_stamp = Column(String, nullable=True)  # ISO8601 from ESP32 RTC
-    temp1 = Column(Float, nullable=True)  # Thermistor 1 (GPIO 33)
-    temp2 = Column(Float, nullable=True)  # Thermistor 2 (GPIO 32)
-    created_at = Column(DateTime, server_default=func.now())
+    created_at = Column(DateTime, server_default=func.now(), index=True)
 
 
 Base.metadata.create_all(bind=engine)
@@ -76,13 +93,23 @@ def get_db():
         db.close()
 
 
-# Input models
-class DataIn(BaseModel):
+# Input Models
+class WaterLevelData(BaseModel):
+    raw_adc: int
+    depth_cm: float
+
+
+class SolarStillDataIn(BaseModel):
+    system_type: str  # "conventional" or "automated"
     temperature: float
-    light_intensity: float
+    temp1: float = None
+    temp2: float = None
+    temp3: float = None
+    temp4: float = None
+    temp5: float = None
+    water_level: WaterLevelData
+    pump_status: str = None  # Optional, only for automated systems
     time_stamp: str
-    temp1: float = None  # Optional
-    temp2: float = None  # Optional
 
 
 # MQTT connection tracking
@@ -91,12 +118,14 @@ mqtt_last_message_time = None
 
 # Prometheus metrics
 REQUEST_COUNT = Counter("http_requests_total", "Total HTTP requests", ["method", "endpoint"])
-MQTT_MESSAGES = Counter("mqtt_messages_total", "Total MQTT messages processed")
+MQTT_MESSAGES = Counter("mqtt_messages_total", "Total MQTT messages processed", ["system_type"])
 MQTT_ERRORS = Counter("mqtt_errors_total", "Total MQTT processing errors")
 MQTT_CONNECTION = Gauge("mqtt_connected", "MQTT connection status (1=connected, 0=disconnected)")
 LAST_DB_WRITE = Gauge("last_db_write_timestamp", "Unix timestamp of last DB write")
-CURRENT_TEMPERATURE = Gauge("current_temperature_celsius", "Current temperature reading")
-CURRENT_LIGHT = Gauge("current_light_intensity_lux", "Current light intensity reading")
+CURRENT_TEMPERATURE = Gauge("current_temperature_celsius", "Current average temperature reading")
+CURRENT_WATER_LEVEL = Gauge("current_water_level_cm", "Current water depth in cm")
+PUMP_STATUS_GAUGE = Gauge("pump_status", "Pump status (1=ON, 0=OFF, -1=N/A)")
+SYSTEM_COUNT = Counter("system_data_count", "Total data points by system type", ["system_type"])
 
 
 def on_connect(client, userdata, flags, rc):
@@ -144,35 +173,65 @@ def on_message(client, userdata, msg):
         data = json.loads(payload)
 
         # Validate required fields
-        required_fields = ["temperature", "light_intensity", "time_stamp"]
+        required_fields = ["system_type", "temperature", "water_level", "time_stamp"]
         missing_fields = [f for f in required_fields if f not in data]
         if missing_fields:
             raise ValueError(f"Missing required fields: {missing_fields}")
 
+        # Validate system_type
+        system_type = data.get("system_type")
+        if system_type not in ["conventional", "automated"]:
+            raise ValueError(f"Invalid system_type: {system_type}")
+
+        # Extract water level data
+        water_level = data.get("water_level")
+        if not isinstance(water_level, dict):
+            raise ValueError("water_level must be an object")
+
         # Create database entry
-        entry = SensorData(
+        entry = SolarStillData(
+            system_type=system_type,
             temperature=float(data.get("temperature")),
-            light_intensity=float(data.get("light_intensity")),
-            time_stamp=data.get("time_stamp"),
             temp1=float(data.get("temp1")) if data.get("temp1") is not None else None,
             temp2=float(data.get("temp2")) if data.get("temp2") is not None else None,
+            temp3=float(data.get("temp3")) if data.get("temp3") is not None else None,
+            temp4=float(data.get("temp4")) if data.get("temp4") is not None else None,
+            temp5=float(data.get("temp5")) if data.get("temp5") is not None else None,
+            water_depth_cm=float(water_level.get("depth_cm")),
+            water_raw_adc=int(water_level.get("raw_adc")) if water_level.get("raw_adc") else None,
+            pump_status=data.get("pump_status") if system_type == "automated" else None,
+            time_stamp=data.get("time_stamp"),
         )
 
         session.add(entry)
         session.commit()
 
         # Update Prometheus metrics
-        MQTT_MESSAGES.inc()
+        MQTT_MESSAGES.labels(system_type=system_type).inc()
+        SYSTEM_COUNT.labels(system_type=system_type).inc()
         LAST_DB_WRITE.set_to_current_time()
         CURRENT_TEMPERATURE.set(entry.temperature)
-        CURRENT_LIGHT.set(entry.light_intensity)
+        CURRENT_WATER_LEVEL.set(entry.water_depth_cm)
+
+        if entry.pump_status == "ON":
+            PUMP_STATUS_GAUGE.set(1)
+        elif entry.pump_status == "OFF":
+            PUMP_STATUS_GAUGE.set(0)
+        else:
+            PUMP_STATUS_GAUGE.set(-1)
 
         print(f"✓ Saved to database:")
         print(f"  - ID: {entry.id}")
-        print(f"  - Temperature: {entry.temperature}°C (avg)")
-        print(f"  - Temp1: {entry.temp1}°C" if entry.temp1 else "  - Temp1: N/A")
-        print(f"  - Temp2: {entry.temp2}°C" if entry.temp2 else "  - Temp2: N/A")
-        print(f"  - Light: {entry.light_intensity} lux")
+        print(f"  - System Type: {entry.system_type}")
+        print(f"  - Temperature (avg): {entry.temperature}°C")
+        if entry.temp1: print(f"  - T1: {entry.temp1}°C")
+        if entry.temp2: print(f"  - T2: {entry.temp2}°C")
+        if entry.temp3: print(f"  - T3: {entry.temp3}°C")
+        if entry.temp4: print(f"  - T4: {entry.temp4}°C")
+        if entry.temp5: print(f"  - T5: {entry.temp5}°C")
+        print(f"  - Water Depth: {entry.water_depth_cm} cm")
+        if entry.pump_status:
+            print(f"  - Pump Status: {entry.pump_status}")
         print(f"  - Timestamp: {entry.time_stamp}")
         print(f"{'=' * 60}\n")
 
@@ -191,7 +250,7 @@ def on_message(client, userdata, msg):
 
 
 # MQTT client setup
-mqtt_client = mqtt.Client(client_id="fastapi_mqtt_client")
+mqtt_client = mqtt.Client(client_id="solar_still_mqtt_client")
 mqtt_client.on_connect = on_connect
 mqtt_client.on_disconnect = on_disconnect
 mqtt_client.on_message = on_message
@@ -228,12 +287,17 @@ async def track_requests(request: Request, call_next):
 @app.get("/")
 def read_root():
     return {
-        "message": "IoT Sensor Data API",
-        "version": "1.0.0",
+        "message": "Unified Solar Still Monitoring API",
+        "version": "2.0.0",
+        "supported_systems": ["conventional", "automated"],
         "endpoints": {
             "/data": "Get recent sensor data",
+            "/data/latest": "Get most recent reading",
+            "/data/range": "Get data within time range",
+            "/data/system/{type}": "Get data by system type",
             "/status": "System health check",
             "/stats": "Database statistics",
+            "/stats/system/{type}": "Statistics by system type",
             "/publish": "Manually publish data (POST)",
             "/metrics": "Prometheus metrics"
         }
@@ -241,92 +305,122 @@ def read_root():
 
 
 @app.get("/data")
-def get_data(limit: int = 50, db: Session = Depends(get_db)):
+def get_data(
+        limit: int = 50,
+        system_type: str = None,
+        db: Session = Depends(get_db)
+):
     """Retrieve recent sensor data (newest first)"""
-    rows = db.query(SensorData).order_by(SensorData.created_at.desc()).limit(limit).all()
+    query = db.query(SolarStillData)
+
+    if system_type:
+        if system_type not in ["conventional", "automated"]:
+            raise HTTPException(status_code=400, detail="Invalid system_type")
+        query = query.filter(SolarStillData.system_type == system_type)
+
+    rows = query.order_by(SolarStillData.created_at.desc()).limit(limit).all()
+
     return {
         "count": len(rows),
         "limit": limit,
-        "data": [
-            {
-                "id": row.id,
-                "temperature": row.temperature,
-                "temp1": row.temp1,
-                "temp2": row.temp2,
-                "light_intensity": row.light_intensity,
-                "time_stamp": row.time_stamp,
-                "created_at": row.created_at.isoformat(),
-            }
-            for row in rows
-        ],
+        "filter": {"system_type": system_type} if system_type else None,
+        "data": [format_sensor_data(row) for row in rows],
     }
 
 
 @app.get("/data/latest")
-def get_latest_data(db: Session = Depends(get_db)):
+def get_latest_data(system_type: str = None, db: Session = Depends(get_db)):
     """Get the most recent sensor reading"""
-    row = db.query(SensorData).order_by(SensorData.created_at.desc()).first()
+    query = db.query(SolarStillData)
+
+    if system_type:
+        if system_type not in ["conventional", "automated"]:
+            raise HTTPException(status_code=400, detail="Invalid system_type")
+        query = query.filter(SolarStillData.system_type == system_type)
+
+    row = query.order_by(SolarStillData.created_at.desc()).first()
+
     if not row:
         return {"message": "No data available"}
 
+    return format_sensor_data(row)
+
+
+@app.get("/data/system/{system_type}")
+def get_data_by_system(
+        system_type: str,
+        limit: int = 50,
+        db: Session = Depends(get_db)
+):
+    """Get data for specific system type"""
+    if system_type not in ["conventional", "automated"]:
+        raise HTTPException(status_code=400, detail="Invalid system_type")
+
+    rows = db.query(SolarStillData).filter(
+        SolarStillData.system_type == system_type
+    ).order_by(SolarStillData.created_at.desc()).limit(limit).all()
+
     return {
-        "id": row.id,
-        "temperature": row.temperature,
-        "temp1": row.temp1,
-        "temp2": row.temp2,
-        "light_intensity": row.light_intensity,
-        "time_stamp": row.time_stamp,
-        "created_at": row.created_at.isoformat(),
+        "system_type": system_type,
+        "count": len(rows),
+        "limit": limit,
+        "data": [format_sensor_data(row) for row in rows],
     }
 
 
 @app.get("/data/range")
-def get_data_range(start: str, end: str, db: Session = Depends(get_db)):
-    """Get data within a time range
-
-    Args:
-        start: ISO format datetime (e.g., 2025-11-10T00:00:00Z)
-        end: ISO format datetime
-    """
+def get_data_range(
+        start: str,
+        end: str,
+        system_type: str = None,
+        db: Session = Depends(get_db)
+):
+    """Get data within a time range"""
     try:
         start_dt = datetime.fromisoformat(start.replace('Z', '+00:00'))
         end_dt = datetime.fromisoformat(end.replace('Z', '+00:00'))
     except ValueError as e:
-        return {"error": f"Invalid datetime format: {e}"}
+        raise HTTPException(status_code=400, detail=f"Invalid datetime format: {e}")
 
-    rows = db.query(SensorData).filter(
-        SensorData.created_at >= start_dt,
-        SensorData.created_at <= end_dt
-    ).order_by(SensorData.created_at.desc()).all()
+    query = db.query(SolarStillData).filter(
+        SolarStillData.created_at >= start_dt,
+        SolarStillData.created_at <= end_dt
+    )
+
+    if system_type:
+        if system_type not in ["conventional", "automated"]:
+            raise HTTPException(status_code=400, detail="Invalid system_type")
+        query = query.filter(SolarStillData.system_type == system_type)
+
+    rows = query.order_by(SolarStillData.created_at.desc()).all()
 
     return {
         "count": len(rows),
         "start": start,
         "end": end,
-        "data": [
-            {
-                "id": row.id,
-                "temperature": row.temperature,
-                "temp1": row.temp1,
-                "temp2": row.temp2,
-                "light_intensity": row.light_intensity,
-                "time_stamp": row.time_stamp,
-                "created_at": row.created_at.isoformat(),
-            }
-            for row in rows
-        ],
+        "filter": {"system_type": system_type} if system_type else None,
+        "data": [format_sensor_data(row) for row in rows],
     }
 
 
 @app.post("/publish")
-def publish_data(data: DataIn, db: Session = Depends(get_db)):
+def publish_data(data: SolarStillDataIn, db: Session = Depends(get_db)):
     """Manually publish data directly to database (bypasses MQTT)"""
-    entry = SensorData(
+    if data.system_type not in ["conventional", "automated"]:
+        raise HTTPException(status_code=400, detail="Invalid system_type")
+
+    entry = SolarStillData(
+        system_type=data.system_type,
         temperature=data.temperature,
-        light_intensity=data.light_intensity,
-        time_stamp=data.time_stamp,
         temp1=data.temp1,
         temp2=data.temp2,
+        temp3=data.temp3,
+        temp4=data.temp4,
+        temp5=data.temp5,
+        water_depth_cm=data.water_level.depth_cm,
+        water_raw_adc=data.water_level.raw_adc,
+        pump_status=data.pump_status if data.system_type == "automated" else None,
+        time_stamp=data.time_stamp,
     )
     db.add(entry)
     db.commit()
@@ -334,54 +428,59 @@ def publish_data(data: DataIn, db: Session = Depends(get_db)):
 
     LAST_DB_WRITE.set_to_current_time()
     CURRENT_TEMPERATURE.set(entry.temperature)
-    CURRENT_LIGHT.set(entry.light_intensity)
+    CURRENT_WATER_LEVEL.set(entry.water_depth_cm)
+    SYSTEM_COUNT.labels(system_type=entry.system_type).inc()
 
     return {
         "status": "saved",
-        "entry": {
-            "id": entry.id,
-            "temperature": entry.temperature,
-            "temp1": entry.temp1,
-            "temp2": entry.temp2,
-            "light_intensity": entry.light_intensity,
-            "time_stamp": entry.time_stamp,
-            "created_at": entry.created_at.isoformat(),
-        }
+        "entry": format_sensor_data(entry)
     }
 
 
 @app.get("/stats")
 def get_statistics(db: Session = Depends(get_db)):
-    """Get database statistics and aggregations"""
-    total_count = db.query(func.count(SensorData.id)).scalar()
+    """Get overall database statistics"""
+    total_count = db.query(func.count(SolarStillData.id)).scalar()
 
     if total_count == 0:
         return {"message": "No data available"}
 
-    avg_temp = db.query(func.avg(SensorData.temperature)).scalar()
-    min_temp = db.query(func.min(SensorData.temperature)).scalar()
-    max_temp = db.query(func.max(SensorData.temperature)).scalar()
+    conv_count = db.query(func.count(SolarStillData.id)).filter(
+        SolarStillData.system_type == "conventional"
+    ).scalar()
 
-    avg_light = db.query(func.avg(SensorData.light_intensity)).scalar()
-    min_light = db.query(func.min(SensorData.light_intensity)).scalar()
-    max_light = db.query(func.max(SensorData.light_intensity)).scalar()
+    auto_count = db.query(func.count(SolarStillData.id)).filter(
+        SolarStillData.system_type == "automated"
+    ).scalar()
 
-    first_entry = db.query(SensorData).order_by(SensorData.created_at.asc()).first()
-    last_entry = db.query(SensorData).order_by(SensorData.created_at.desc()).first()
+    avg_temp = db.query(func.avg(SolarStillData.temperature)).scalar()
+    min_temp = db.query(func.min(SolarStillData.temperature)).scalar()
+    max_temp = db.query(func.max(SolarStillData.temperature)).scalar()
+
+    avg_water = db.query(func.avg(SolarStillData.water_depth_cm)).scalar()
+    min_water = db.query(func.min(SolarStillData.water_depth_cm)).scalar()
+    max_water = db.query(func.max(SolarStillData.water_depth_cm)).scalar()
+
+    first_entry = db.query(SolarStillData).order_by(SolarStillData.created_at.asc()).first()
+    last_entry = db.query(SolarStillData).order_by(SolarStillData.created_at.desc()).first()
 
     return {
         "total_records": total_count,
+        "system_breakdown": {
+            "conventional": conv_count,
+            "automated": auto_count
+        },
         "temperature": {
             "average": round(avg_temp, 2),
             "min": round(min_temp, 2),
             "max": round(max_temp, 2),
             "unit": "°C"
         },
-        "light_intensity": {
-            "average": round(avg_light, 2),
-            "min": round(min_light, 2),
-            "max": round(max_light, 2),
-            "unit": "lux"
+        "water_level": {
+            "average": round(avg_water, 2),
+            "min": round(min_water, 2),
+            "max": round(max_water, 2),
+            "unit": "cm"
         },
         "time_range": {
             "first_record": first_entry.created_at.isoformat() if first_entry else None,
@@ -390,12 +489,75 @@ def get_statistics(db: Session = Depends(get_db)):
     }
 
 
+@app.get("/stats/system/{system_type}")
+def get_system_statistics(system_type: str, db: Session = Depends(get_db)):
+    """Get statistics for specific system type"""
+    if system_type not in ["conventional", "automated"]:
+        raise HTTPException(status_code=400, detail="Invalid system_type")
+
+    count = db.query(func.count(SolarStillData.id)).filter(
+        SolarStillData.system_type == system_type
+    ).scalar()
+
+    if count == 0:
+        return {"message": f"No data available for {system_type} systems"}
+
+    avg_temp = db.query(func.avg(SolarStillData.temperature)).filter(
+        SolarStillData.system_type == system_type
+    ).scalar()
+
+    min_temp = db.query(func.min(SolarStillData.temperature)).filter(
+        SolarStillData.system_type == system_type
+    ).scalar()
+
+    max_temp = db.query(func.max(SolarStillData.temperature)).filter(
+        SolarStillData.system_type == system_type
+    ).scalar()
+
+    avg_water = db.query(func.avg(SolarStillData.water_depth_cm)).filter(
+        SolarStillData.system_type == system_type
+    ).scalar()
+
+    result = {
+        "system_type": system_type,
+        "total_records": count,
+        "temperature": {
+            "average": round(avg_temp, 2),
+            "min": round(min_temp, 2),
+            "max": round(max_temp, 2),
+            "unit": "°C"
+        },
+        "water_level": {
+            "average": round(avg_water, 2),
+            "unit": "cm"
+        }
+    }
+
+    if system_type == "automated":
+        pump_on = db.query(func.count(SolarStillData.id)).filter(
+            SolarStillData.system_type == "automated",
+            SolarStillData.pump_status == "ON"
+        ).scalar()
+
+        pump_off = db.query(func.count(SolarStillData.id)).filter(
+            SolarStillData.system_type == "automated",
+            SolarStillData.pump_status == "OFF"
+        ).scalar()
+
+        result["pump_statistics"] = {
+            "on_count": pump_on,
+            "off_count": pump_off,
+            "on_percentage": round((pump_on / count) * 100, 2) if count > 0 else 0
+        }
+
+    return result
+
+
 @app.get("/status")
 def get_status(db: Session = Depends(get_db)):
     """Check system health (FastAPI, MQTT, Database)"""
-    last_entry = db.query(SensorData).order_by(SensorData.created_at.desc()).first()
+    last_entry = db.query(SolarStillData).order_by(SolarStillData.created_at.desc()).first()
 
-    # Calculate time since last message
     time_since_last_msg = None
     if mqtt_last_message_time:
         delta = datetime.now() - mqtt_last_message_time
@@ -408,15 +570,7 @@ def get_status(db: Session = Depends(get_db)):
         "mqtt_last_message": time_since_last_msg,
         "database_status": "ok" if last_entry else "no data yet",
         "database_url": f"{settings.POSTGRESQL_HOST}:{settings.POSTGRESQL_PORT}/{settings.POSTGRESQL_DBNAME}",
-        "last_data": {
-            "id": last_entry.id,
-            "temperature": last_entry.temperature,
-            "temp1": last_entry.temp1,
-            "temp2": last_entry.temp2,
-            "light_intensity": last_entry.light_intensity,
-            "time_stamp": last_entry.time_stamp,
-            "created_at": last_entry.created_at.isoformat(),
-        } if last_entry else None,
+        "last_data": format_sensor_data(last_entry) if last_entry else None,
     }
 
 
@@ -429,13 +583,40 @@ def metrics():
 @app.delete("/data/{record_id}")
 def delete_record(record_id: int, db: Session = Depends(get_db)):
     """Delete a specific record by ID"""
-    record = db.query(SensorData).filter(SensorData.id == record_id).first()
+    record = db.query(SolarStillData).filter(SolarStillData.id == record_id).first()
     if not record:
-        return {"error": "Record not found"}
+        raise HTTPException(status_code=404, detail="Record not found")
 
     db.delete(record)
     db.commit()
     return {"status": "deleted", "id": record_id}
+
+
+# Helper function to format sensor data
+def format_sensor_data(row):
+    data = {
+        "id": row.id,
+        "system_type": row.system_type,
+        "temperature": row.temperature,
+        "temperatures": {
+            "T1": row.temp1,
+            "T2": row.temp2,
+            "T3": row.temp3,
+            "T4": row.temp4,
+            "T5": row.temp5,
+        },
+        "water_level": {
+            "depth_cm": row.water_depth_cm,
+            "raw_adc": row.water_raw_adc,
+        },
+        "time_stamp": row.time_stamp,
+        "created_at": row.created_at.isoformat(),
+    }
+
+    if row.system_type == "automated":
+        data["pump_status"] = row.pump_status
+
+    return data
 
 
 if __name__ == "__main__":

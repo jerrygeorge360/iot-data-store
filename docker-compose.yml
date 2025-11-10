@@ -7,7 +7,7 @@ services:
     environment:
       POSTGRES_USER: iot_user
       POSTGRES_PASSWORD: iot_password
-      POSTGRES_DB: sensor_db
+      POSTGRES_DB: solar_still_db
       PGDATA: /var/lib/postgresql/data/pgdata
     volumes:
       - postgres_data:/var/lib/postgresql/data
@@ -16,7 +16,7 @@ services:
     networks:
       - iot-network
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U iot_user -d sensor_db"]
+      test: ["CMD-SHELL", "pg_isready -U iot_user -d solar_still_db"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -53,8 +53,8 @@ services:
       POSTGRESQL_PORT: 5432  # Internal port (inside Docker network)
       POSTGRESQL_USER: iot_user
       POSTGRESQL_PASSWORD: iot_password
-      POSTGRESQL_DBNAME: sensor_db
-      POSTGRESQL_URI: postgresql://iot_user:iot_password@postgres:5432/sensor_db
+      POSTGRESQL_DBNAME: solar_still_db
+      POSTGRESQL_URI: postgresql://iot_user:iot_password@postgres:5432/solar_still_db
       MQTT_BROKER: mosquitto
       MQTT_PORT: 1883  # Internal port (inside Docker network)
     ports:
