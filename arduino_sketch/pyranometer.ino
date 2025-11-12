@@ -1,7 +1,5 @@
 /*
-ESP32 Multi-Sensor MQTT Publisher + LCD Status Display
-Sensors: DS1307 RTC, BH1750 Light Sensor, 2x Thermistors
-Displays WiFi/MQTT status and sensor data on a 16x2 I2C LCD
+ESP32 Thermistor - Read as Voltage Instead of Temperature
 */
 
 #include <WiFi.h>
@@ -13,8 +11,8 @@ Displays WiFi/MQTT status and sensor data on a 16x2 I2C LCD
 
 // ========== WiFi & MQTT Settings ==========
 const char* WIFI_SSID     = "Bionic";
-const char* WIFI_PASSWORD = ""; // or NULL if open network
-const char* MQTT_BROKER   = "192.168.17.234";
+const char* WIFI_PASSWORD = "12345678";
+const char* MQTT_BROKER   = "134.112.56.111";
 const int   MQTT_PORT     = 1884;
 const char* MQTT_TOPIC    = "sensors/data";
 const char* CLIENT_ID     = "ESP32_Client_1";
@@ -25,19 +23,16 @@ const char* CLIENT_ID     = "ESP32_Client_1";
 #define SDA_PIN 21
 #define SCL_PIN 22
 
-// ========== Thermistor Configuration ==========
-#define THERMISTOR_NOMINAL 10000
-#define TEMPERATURE_NOMINAL 25
-#define B_COEFFICIENT 3950
-#define SERIES_RESISTOR 10000
+// ========== ADC Configuration ==========
 #define ADC_MAX 4095
+#define ADC_VREF 3.3  // ESP32 reference voltage
 
 // ========== Objects ==========
 WiFiClient espClient;
 PubSubClient client(espClient);
 RTC_DS1307 rtc;
 BH1750 lightMeter;
-LiquidCrystal_I2C lcd(0x27, 16, 2);  // I2C LCD (address may be 0x3F on some modules)
+LiquidCrystal_I2C lcd(0x27, 16, 2);
 
 // ========== Function Prototypes ==========
 void connectWiFi();
@@ -45,14 +40,15 @@ void connectMQTT();
 void publishSensorData();
 void initI2C();
 void scanI2C();
-float readThermistor(int pin);
+float readThermistorVoltage(int pin);
+int readThermistorRaw(int pin);
 void lcdStatus(const String &line1, const String &line2);
 
 // ========== Setup ==========
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.println("\n=== ESP32 Multi-Sensor MQTT System ===");
+  Serial.println("\n=== ESP32 Multi-Sensor MQTT System (Voltage Mode) ===");
 
   // Initialize LCD
   lcd.init();
@@ -95,8 +91,8 @@ void setup() {
   // Setup MQTT
   client.setServer(MQTT_BROKER, MQTT_PORT);
 
-  lcdStatus("System Ready", "Starting...");
-  Serial.println("\n=== System Ready ===");
+  lcdStatus("System Ready", "Voltage Mode");
+  Serial.println("\n=== System Ready - Voltage Mode ===");
 }
 
 // ========== Main Loop ==========
@@ -108,7 +104,7 @@ void loop() {
   static unsigned long lastMsg = 0;
   unsigned long now = millis();
 
-  if (now - lastMsg > 60000) {
+  if (now - lastMsg > 3600000) {
     lastMsg = now;
     publishSensorData();
   }
@@ -188,29 +184,32 @@ void connectMQTT() {
   }
 }
 
-// ========== Read Thermistor Temperature ==========
-float readThermistor(int pin) {
-  int adcValue = analogRead(pin);
-  if (adcValue == 0) return -999.0;
+// ========== Read Raw ADC Value ==========
+int readThermistorRaw(int pin) {
+  return analogRead(pin);
+}
 
-  float resistance = SERIES_RESISTOR / ((ADC_MAX / (float)adcValue) - 1.0);
-  float steinhart;
-  steinhart = resistance / THERMISTOR_NOMINAL;
-  steinhart = log(steinhart);
-  steinhart /= B_COEFFICIENT;
-  steinhart += 1.0 / (TEMPERATURE_NOMINAL + 273.15);
-  steinhart = 1.0 / steinhart;
-  steinhart -= 273.15;
-  return steinhart;
+// ========== Read Thermistor Voltage ==========
+float readThermistorVoltage(int pin) {
+  int adcValue = analogRead(pin);
+  // Convert ADC reading to voltage
+  float voltage = (adcValue / (float)ADC_MAX) * ADC_VREF;
+  return voltage;
 }
 
 // ========== Publish Sensor Data ==========
 void publishSensorData() {
   Serial.println("\n=== Reading Sensors ===");
 
-  float temp1 = readThermistor(THERMISTOR1_PIN);
-  float temp2 = readThermistor(THERMISTOR2_PIN);
-  float avgTemp = (temp1 + temp2) / 2.0;
+  // Read as voltage
+  float voltage1 = readThermistorVoltage(THERMISTOR1_PIN);
+  float voltage2 = readThermistorVoltage(THERMISTOR2_PIN);
+  float voltageDifference = abs((voltage1 - voltage2));
+
+  // Read raw ADC values (optional)
+  int raw1 = readThermistorRaw(THERMISTOR1_PIN);
+  int raw2 = readThermistorRaw(THERMISTOR2_PIN);
+
   float lightIntensity = lightMeter.readLightLevel();
   if (lightIntensity < 0) lightIntensity = 0;
 
@@ -224,18 +223,30 @@ void publishSensorData() {
     snprintf(timestamp, sizeof(timestamp), "FallbackTime");
   }
 
+  // Build JSON payload with voltage data
   String payload = "{";
-  payload += "\"temperature\":" + String(avgTemp, 2);
+  payload += "\"voltage_difference\":" + String(voltageDifference, 3);
+  payload += ",\"voltage1\":" + String(voltage1, 3);
+  payload += ",\"voltage2\":" + String(voltage2, 3);
+  payload += ",\"adc_raw1\":" + String(raw1);
+  payload += ",\"adc_raw2\":" + String(raw2);
   payload += ",\"light_intensity\":" + String(lightIntensity, 1);
-  payload += ",\"timestamp\":\"" + String(timestamp) + "\"";
+  payload += ",\"time_stamp\":\"" + String(timestamp) + "\"";
   payload += "}";
 
+  // Print to serial for debugging
+  Serial.println("--- Voltage Readings ---");
+  Serial.print("Voltage 1: "); Serial.print(voltage1, 3); Serial.println(" V");
+  Serial.print("Voltage 2: "); Serial.print(voltage2, 3); Serial.println(" V");
+  Serial.print("ADC Raw 1: "); Serial.println(raw1);
+  Serial.print("ADC Raw 2: "); Serial.println(raw2);
   Serial.println(payload);
+
   lcdStatus("Publishing...", "");
 
   if (client.publish(MQTT_TOPIC, payload.c_str())) {
     Serial.println("✓ Published successfully!");
-    lcdStatus("Data Sent ✓", "T:" + String(avgTemp, 1) + "C L:" + String(lightIntensity, 0));
+    lcdStatus("Data Sent ✓", "V1:" + String(voltage1, 2) + " V2:" + String(voltage2, 2));
   } else {
     Serial.println("✗ Publish failed!");
     lcdStatus("Publish Failed", "Retry later");

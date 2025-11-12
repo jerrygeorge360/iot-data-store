@@ -34,7 +34,7 @@ class Settings(BaseSettings):
 settings = Settings()
 
 # FastAPI Setup
-app = FastAPI(title="IoT Sensor Data API", version="1.0.0")
+app = FastAPI(title="IoT Sensor Data API - Voltage Mode", version="2.0.0")
 
 # Database Setup
 DATABASE_URL = f"postgresql+psycopg2://{settings.POSTGRESQL_USER}:{settings.POSTGRESQL_PASSWORD}@{settings.POSTGRESQL_HOST}:{settings.POSTGRESQL_PORT}/{settings.POSTGRESQL_DBNAME}"
@@ -51,17 +51,30 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 
-# Enhanced Database model with temp1 and temp2
+# Updated Database model for voltage readings
 class SensorData(Base):
     __tablename__ = "pyranometer"
 
     id = Column(BigInteger, primary_key=True, index=True)
-    temperature = Column(Float, nullable=False)  # Average temperature
+
+    # Voltage readings (new)
+    voltage_difference = Column(Float, nullable=True)  # |V1 - V2|
+    voltage1 = Column(Float, nullable=True)  # Thermistor 1 voltage
+    voltage2 = Column(Float, nullable=True)  # Thermistor 2 voltage
+    adc_raw1 = Column(Integer, nullable=True)  # Raw ADC value 1
+    adc_raw2 = Column(Integer, nullable=True)  # Raw ADC value 2
+
+    # Light sensor
     light_intensity = Column(Float, nullable=False)
+
+    # Timestamps
     time_stamp = Column(String, nullable=True)  # ISO8601 from ESP32 RTC
-    temp1 = Column(Float, nullable=True)  # Thermistor 1 (GPIO 33)
-    temp2 = Column(Float, nullable=True)  # Thermistor 2 (GPIO 32)
     created_at = Column(DateTime, server_default=func.now())
+
+    # Legacy fields (keep for backward compatibility)
+    temperature = Column(Float, nullable=True)  # Optional: can be calculated from voltage
+    temp1 = Column(Float, nullable=True)
+    temp2 = Column(Float, nullable=True)
 
 
 Base.metadata.create_all(bind=engine)
@@ -77,12 +90,29 @@ def get_db():
 
 
 # Input models
-class DataIn(BaseModel):
-    temperature: float
+class VoltageDataIn(BaseModel):
+    voltage_difference: float
+    voltage1: float
+    voltage2: float
+    adc_raw1: int
+    adc_raw2: int
     light_intensity: float
     time_stamp: str
-    temp1: float = None  # Optional
-    temp2: float = None  # Optional
+
+
+class DataIn(BaseModel):
+    """Legacy model for backward compatibility"""
+    temperature: float = None
+    light_intensity: float
+    time_stamp: str
+    temp1: float = None
+    temp2: float = None
+    # New voltage fields (optional for legacy support)
+    voltage1: float = None
+    voltage2: float = None
+    voltage_difference: float = None
+    adc_raw1: int = None
+    adc_raw2: int = None
 
 
 # MQTT connection tracking
@@ -95,7 +125,8 @@ MQTT_MESSAGES = Counter("mqtt_messages_total", "Total MQTT messages processed")
 MQTT_ERRORS = Counter("mqtt_errors_total", "Total MQTT processing errors")
 MQTT_CONNECTION = Gauge("mqtt_connected", "MQTT connection status (1=connected, 0=disconnected)")
 LAST_DB_WRITE = Gauge("last_db_write_timestamp", "Unix timestamp of last DB write")
-CURRENT_TEMPERATURE = Gauge("current_temperature_celsius", "Current temperature reading")
+CURRENT_VOLTAGE1 = Gauge("current_voltage1_volts", "Current voltage1 reading")
+CURRENT_VOLTAGE2 = Gauge("current_voltage2_volts", "Current voltage2 reading")
 CURRENT_LIGHT = Gauge("current_light_intensity_lux", "Current light intensity reading")
 
 
@@ -143,37 +174,78 @@ def on_message(client, userdata, msg):
     try:
         data = json.loads(payload)
 
-        # Validate required fields
-        required_fields = ["temperature", "light_intensity", "time_stamp"]
-        missing_fields = [f for f in required_fields if f not in data]
-        if missing_fields:
-            raise ValueError(f"Missing required fields: {missing_fields}")
+        # Determine if this is voltage data or legacy temperature data
+        is_voltage_data = "voltage1" in data and "voltage2" in data
 
-        # Create database entry
-        entry = SensorData(
-            temperature=float(data.get("temperature")),
-            light_intensity=float(data.get("light_intensity")),
-            time_stamp=data.get("time_stamp"),
-            temp1=float(data.get("temp1")) if data.get("temp1") is not None else None,
-            temp2=float(data.get("temp2")) if data.get("temp2") is not None else None,
-        )
+        if is_voltage_data:
+            # New voltage format
+            required_fields = ["voltage1", "voltage2", "light_intensity", "time_stamp"]
+            missing_fields = [f for f in required_fields if f not in data]
+            if missing_fields:
+                raise ValueError(f"Missing required fields: {missing_fields}")
 
-        session.add(entry)
-        session.commit()
+            entry = SensorData(
+                voltage_difference=float(data.get("voltage_difference")) if data.get(
+                    "voltage_difference") is not None else None,
+                voltage1=float(data.get("voltage1")),
+                voltage2=float(data.get("voltage2")),
+                adc_raw1=int(data.get("adc_raw1")) if data.get("adc_raw1") is not None else None,
+                adc_raw2=int(data.get("adc_raw2")) if data.get("adc_raw2") is not None else None,
+                light_intensity=float(data.get("light_intensity")),
+                time_stamp=data.get("time_stamp"),
+            )
 
-        # Update Prometheus metrics
-        MQTT_MESSAGES.inc()
-        LAST_DB_WRITE.set_to_current_time()
-        CURRENT_TEMPERATURE.set(entry.temperature)
-        CURRENT_LIGHT.set(entry.light_intensity)
+            session.add(entry)
+            session.commit()
 
-        print(f"✓ Saved to database:")
-        print(f"  - ID: {entry.id}")
-        print(f"  - Temperature: {entry.temperature}°C (avg)")
-        print(f"  - Temp1: {entry.temp1}°C" if entry.temp1 else "  - Temp1: N/A")
-        print(f"  - Temp2: {entry.temp2}°C" if entry.temp2 else "  - Temp2: N/A")
-        print(f"  - Light: {entry.light_intensity} lux")
-        print(f"  - Timestamp: {entry.time_stamp}")
+            # Update Prometheus metrics
+            MQTT_MESSAGES.inc()
+            LAST_DB_WRITE.set_to_current_time()
+            CURRENT_VOLTAGE1.set(entry.voltage1)
+            CURRENT_VOLTAGE2.set(entry.voltage2)
+            CURRENT_LIGHT.set(entry.light_intensity)
+
+            print(f"✓ Saved to database (VOLTAGE MODE):")
+            print(f"  - ID: {entry.id}")
+            print(f"  - Voltage1: {entry.voltage1}V")
+            print(f"  - Voltage2: {entry.voltage2}V")
+            print(f"  - Voltage Diff: {entry.voltage_difference}V" if entry.voltage_difference else "")
+            print(f"  - ADC Raw1: {entry.adc_raw1}" if entry.adc_raw1 else "")
+            print(f"  - ADC Raw2: {entry.adc_raw2}" if entry.adc_raw2 else "")
+            print(f"  - Light: {entry.light_intensity} lux")
+            print(f"  - Timestamp: {entry.time_stamp}")
+
+        else:
+            # Legacy temperature format
+            required_fields = ["temperature", "light_intensity", "time_stamp"]
+            missing_fields = [f for f in required_fields if f not in data]
+            if missing_fields:
+                raise ValueError(f"Missing required fields: {missing_fields}")
+
+            entry = SensorData(
+                temperature=float(data.get("temperature")),
+                light_intensity=float(data.get("light_intensity")),
+                time_stamp=data.get("time_stamp"),
+                temp1=float(data.get("temp1")) if data.get("temp1") is not None else None,
+                temp2=float(data.get("temp2")) if data.get("temp2") is not None else None,
+            )
+
+            session.add(entry)
+            session.commit()
+
+            # Update Prometheus metrics
+            MQTT_MESSAGES.inc()
+            LAST_DB_WRITE.set_to_current_time()
+            CURRENT_LIGHT.set(entry.light_intensity)
+
+            print(f"✓ Saved to database (TEMPERATURE MODE):")
+            print(f"  - ID: {entry.id}")
+            print(f"  - Temperature: {entry.temperature}°C (avg)")
+            print(f"  - Temp1: {entry.temp1}°C" if entry.temp1 else "  - Temp1: N/A")
+            print(f"  - Temp2: {entry.temp2}°C" if entry.temp2 else "  - Temp2: N/A")
+            print(f"  - Light: {entry.light_intensity} lux")
+            print(f"  - Timestamp: {entry.time_stamp}")
+
         print(f"{'=' * 60}\n")
 
     except json.JSONDecodeError as e:
@@ -228,8 +300,9 @@ async def track_requests(request: Request, call_next):
 @app.get("/")
 def read_root():
     return {
-        "message": "IoT Sensor Data API",
-        "version": "1.0.0",
+        "message": "IoT Sensor Data API - Voltage Mode",
+        "version": "2.0.0",
+        "mode": "voltage_readings",
         "endpoints": {
             "/data": "Get recent sensor data",
             "/status": "System health check",
@@ -250,12 +323,18 @@ def get_data(limit: int = 50, db: Session = Depends(get_db)):
         "data": [
             {
                 "id": row.id,
-                "temperature": row.temperature,
-                "temp1": row.temp1,
-                "temp2": row.temp2,
+                "voltage1": row.voltage1,
+                "voltage2": row.voltage2,
+                "voltage_difference": row.voltage_difference,
+                "adc_raw1": row.adc_raw1,
+                "adc_raw2": row.adc_raw2,
                 "light_intensity": row.light_intensity,
                 "time_stamp": row.time_stamp,
                 "created_at": row.created_at.isoformat(),
+                # Legacy fields (if present)
+                "temperature": row.temperature,
+                "temp1": row.temp1,
+                "temp2": row.temp2,
             }
             for row in rows
         ],
@@ -271,12 +350,18 @@ def get_latest_data(db: Session = Depends(get_db)):
 
     return {
         "id": row.id,
-        "temperature": row.temperature,
-        "temp1": row.temp1,
-        "temp2": row.temp2,
+        "voltage1": row.voltage1,
+        "voltage2": row.voltage2,
+        "voltage_difference": row.voltage_difference,
+        "adc_raw1": row.adc_raw1,
+        "adc_raw2": row.adc_raw2,
         "light_intensity": row.light_intensity,
         "time_stamp": row.time_stamp,
         "created_at": row.created_at.isoformat(),
+        # Legacy fields
+        "temperature": row.temperature,
+        "temp1": row.temp1,
+        "temp2": row.temp2,
     }
 
 
@@ -306,12 +391,17 @@ def get_data_range(start: str, end: str, db: Session = Depends(get_db)):
         "data": [
             {
                 "id": row.id,
-                "temperature": row.temperature,
-                "temp1": row.temp1,
-                "temp2": row.temp2,
+                "voltage1": row.voltage1,
+                "voltage2": row.voltage2,
+                "voltage_difference": row.voltage_difference,
+                "adc_raw1": row.adc_raw1,
+                "adc_raw2": row.adc_raw2,
                 "light_intensity": row.light_intensity,
                 "time_stamp": row.time_stamp,
                 "created_at": row.created_at.isoformat(),
+                "temperature": row.temperature,
+                "temp1": row.temp1,
+                "temp2": row.temp2,
             }
             for row in rows
         ],
@@ -322,9 +412,15 @@ def get_data_range(start: str, end: str, db: Session = Depends(get_db)):
 def publish_data(data: DataIn, db: Session = Depends(get_db)):
     """Manually publish data directly to database (bypasses MQTT)"""
     entry = SensorData(
-        temperature=data.temperature,
+        voltage1=data.voltage1,
+        voltage2=data.voltage2,
+        voltage_difference=data.voltage_difference,
+        adc_raw1=data.adc_raw1,
+        adc_raw2=data.adc_raw2,
         light_intensity=data.light_intensity,
         time_stamp=data.time_stamp,
+        # Legacy fields
+        temperature=data.temperature,
         temp1=data.temp1,
         temp2=data.temp2,
     )
@@ -333,16 +429,21 @@ def publish_data(data: DataIn, db: Session = Depends(get_db)):
     db.refresh(entry)
 
     LAST_DB_WRITE.set_to_current_time()
-    CURRENT_TEMPERATURE.set(entry.temperature)
+    if entry.voltage1:
+        CURRENT_VOLTAGE1.set(entry.voltage1)
+    if entry.voltage2:
+        CURRENT_VOLTAGE2.set(entry.voltage2)
     CURRENT_LIGHT.set(entry.light_intensity)
 
     return {
         "status": "saved",
         "entry": {
             "id": entry.id,
-            "temperature": entry.temperature,
-            "temp1": entry.temp1,
-            "temp2": entry.temp2,
+            "voltage1": entry.voltage1,
+            "voltage2": entry.voltage2,
+            "voltage_difference": entry.voltage_difference,
+            "adc_raw1": entry.adc_raw1,
+            "adc_raw2": entry.adc_raw2,
             "light_intensity": entry.light_intensity,
             "time_stamp": entry.time_stamp,
             "created_at": entry.created_at.isoformat(),
@@ -358,9 +459,14 @@ def get_statistics(db: Session = Depends(get_db)):
     if total_count == 0:
         return {"message": "No data available"}
 
-    avg_temp = db.query(func.avg(SensorData.temperature)).scalar()
-    min_temp = db.query(func.min(SensorData.temperature)).scalar()
-    max_temp = db.query(func.max(SensorData.temperature)).scalar()
+    # Voltage statistics
+    avg_v1 = db.query(func.avg(SensorData.voltage1)).filter(SensorData.voltage1.isnot(None)).scalar()
+    min_v1 = db.query(func.min(SensorData.voltage1)).filter(SensorData.voltage1.isnot(None)).scalar()
+    max_v1 = db.query(func.max(SensorData.voltage1)).filter(SensorData.voltage1.isnot(None)).scalar()
+
+    avg_v2 = db.query(func.avg(SensorData.voltage2)).filter(SensorData.voltage2.isnot(None)).scalar()
+    min_v2 = db.query(func.min(SensorData.voltage2)).filter(SensorData.voltage2.isnot(None)).scalar()
+    max_v2 = db.query(func.max(SensorData.voltage2)).filter(SensorData.voltage2.isnot(None)).scalar()
 
     avg_light = db.query(func.avg(SensorData.light_intensity)).scalar()
     min_light = db.query(func.min(SensorData.light_intensity)).scalar()
@@ -369,18 +475,12 @@ def get_statistics(db: Session = Depends(get_db)):
     first_entry = db.query(SensorData).order_by(SensorData.created_at.asc()).first()
     last_entry = db.query(SensorData).order_by(SensorData.created_at.desc()).first()
 
-    return {
+    stats = {
         "total_records": total_count,
-        "temperature": {
-            "average": round(avg_temp, 2),
-            "min": round(min_temp, 2),
-            "max": round(max_temp, 2),
-            "unit": "°C"
-        },
         "light_intensity": {
-            "average": round(avg_light, 2),
-            "min": round(min_light, 2),
-            "max": round(max_light, 2),
+            "average": round(avg_light, 2) if avg_light else None,
+            "min": round(min_light, 2) if min_light else None,
+            "max": round(max_light, 2) if max_light else None,
             "unit": "lux"
         },
         "time_range": {
@@ -388,6 +488,25 @@ def get_statistics(db: Session = Depends(get_db)):
             "last_record": last_entry.created_at.isoformat() if last_entry else None,
         }
     }
+
+    # Add voltage stats if available
+    if avg_v1 is not None:
+        stats["voltage1"] = {
+            "average": round(avg_v1, 3),
+            "min": round(min_v1, 3),
+            "max": round(max_v1, 3),
+            "unit": "V"
+        }
+
+    if avg_v2 is not None:
+        stats["voltage2"] = {
+            "average": round(avg_v2, 3),
+            "min": round(min_v2, 3),
+            "max": round(max_v2, 3),
+            "unit": "V"
+        }
+
+    return stats
 
 
 @app.get("/status")
@@ -403,6 +522,7 @@ def get_status(db: Session = Depends(get_db)):
 
     return {
         "fastapi_status": "online",
+        "mode": "voltage_readings",
         "mqtt_status": "connected" if mqtt_connected else "disconnected",
         "mqtt_broker": f"{settings.MQTT_BROKER}:{settings.MQTT_PORT}",
         "mqtt_last_message": time_since_last_msg,
@@ -410,9 +530,11 @@ def get_status(db: Session = Depends(get_db)):
         "database_url": f"{settings.POSTGRESQL_HOST}:{settings.POSTGRESQL_PORT}/{settings.POSTGRESQL_DBNAME}",
         "last_data": {
             "id": last_entry.id,
-            "temperature": last_entry.temperature,
-            "temp1": last_entry.temp1,
-            "temp2": last_entry.temp2,
+            "voltage1": last_entry.voltage1,
+            "voltage2": last_entry.voltage2,
+            "voltage_difference": last_entry.voltage_difference,
+            "adc_raw1": last_entry.adc_raw1,
+            "adc_raw2": last_entry.adc_raw2,
             "light_intensity": last_entry.light_intensity,
             "time_stamp": last_entry.time_stamp,
             "created_at": last_entry.created_at.isoformat(),
