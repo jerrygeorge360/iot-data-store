@@ -33,8 +33,8 @@ settings = Settings()
 # FastAPI Setup
 app = FastAPI(
     title="Unified Solar Still Monitoring API",
-    version="2.0.0",
-    description="Supports both conventional and automated solar still systems"
+    version="2.1.0",
+    description="Supports both conventional and hybrid solar still systems"
 )
 
 # Database Setup
@@ -59,7 +59,7 @@ class SolarStillData(Base):
     id = Column(BigInteger, primary_key=True, index=True)
 
     # System identification
-    system_type = Column(String, nullable=False, index=True)  # "conventional" or "automated"
+    system_type = Column(String, nullable=False, index=True)  # "conventional" or "hybrid"
 
     # Temperature data
     temperature = Column(Float, nullable=False)  # Average temperature
@@ -73,11 +73,11 @@ class SolarStillData(Base):
     water_depth_cm = Column(Float, nullable=False)
     water_raw_adc = Column(Integer, nullable=True)
 
-    # Pump status (only for automated systems)
+    # Pump status (only for hybrid systems)
     pump_status = Column(String, nullable=True)  # "ON", "OFF", or null for conventional
 
     # Timestamps
-    time_stamp = Column(String, nullable=True)  # ISO8601 from ESP32 RTC
+    uptime_seconds = Column(BigInteger, nullable=True)  # System uptime from ESP32
     created_at = Column(DateTime, server_default=func.now(), index=True)
 
 
@@ -100,7 +100,7 @@ class WaterLevelData(BaseModel):
 
 
 class SolarStillDataIn(BaseModel):
-    system_type: str  # "conventional" or "automated"
+    system_type: str  # "conventional" or "hybrid"
     temperature: float
     temp1: float = None
     temp2: float = None
@@ -108,8 +108,8 @@ class SolarStillDataIn(BaseModel):
     temp4: float = None
     temp5: float = None
     water_level: WaterLevelData
-    pump_status: str = None  # Optional, only for automated systems
-    time_stamp: str
+    pump_status: str = None  # Optional, only for hybrid systems
+    uptime_seconds: int = None  # Optional uptime from ESP32
 
 
 # MQTT connection tracking
@@ -173,15 +173,15 @@ def on_message(client, userdata, msg):
         data = json.loads(payload)
 
         # Validate required fields
-        required_fields = ["system_type", "temperature", "water_level", "time_stamp"]
+        required_fields = ["system_type", "temperature", "water_level"]
         missing_fields = [f for f in required_fields if f not in data]
         if missing_fields:
             raise ValueError(f"Missing required fields: {missing_fields}")
 
         # Validate system_type
         system_type = data.get("system_type")
-        if system_type not in ["conventional", "automated"]:
-            raise ValueError(f"Invalid system_type: {system_type}")
+        if system_type not in ["conventional", "hybrid"]:
+            raise ValueError(f"Invalid system_type: {system_type}. Must be 'conventional' or 'hybrid'")
 
         # Extract water level data
         water_level = data.get("water_level")
@@ -199,8 +199,8 @@ def on_message(client, userdata, msg):
             temp5=float(data.get("temp5")) if data.get("temp5") is not None else None,
             water_depth_cm=float(water_level.get("depth_cm")),
             water_raw_adc=int(water_level.get("raw_adc")) if water_level.get("raw_adc") else None,
-            pump_status=data.get("pump_status") if system_type == "automated" else None,
-            time_stamp=data.get("time_stamp"),
+            pump_status=data.get("pump_status") if system_type == "hybrid" else None,
+            uptime_seconds=int(data.get("uptime_seconds")) if data.get("uptime_seconds") is not None else None,
         )
 
         session.add(entry)
@@ -230,9 +230,14 @@ def on_message(client, userdata, msg):
         if entry.temp4: print(f"  - T4: {entry.temp4}°C")
         if entry.temp5: print(f"  - T5: {entry.temp5}°C")
         print(f"  - Water Depth: {entry.water_depth_cm} cm")
+        print(f"  - Raw ADC: {entry.water_raw_adc}")
         if entry.pump_status:
             print(f"  - Pump Status: {entry.pump_status}")
-        print(f"  - Timestamp: {entry.time_stamp}")
+        if entry.uptime_seconds:
+            hours = entry.uptime_seconds // 3600
+            minutes = (entry.uptime_seconds % 3600) // 60
+            seconds = entry.uptime_seconds % 60
+            print(f"  - ESP32 Uptime: {hours}h {minutes}m {seconds}s")
         print(f"{'=' * 60}\n")
 
     except json.JSONDecodeError as e:
@@ -288,8 +293,8 @@ async def track_requests(request: Request, call_next):
 def read_root():
     return {
         "message": "Unified Solar Still Monitoring API",
-        "version": "2.0.0",
-        "supported_systems": ["conventional", "automated"],
+        "version": "2.1.0",
+        "supported_systems": ["conventional", "hybrid"],
         "endpoints": {
             "/data": "Get recent sensor data",
             "/data/latest": "Get most recent reading",
@@ -314,8 +319,8 @@ def get_data(
     query = db.query(SolarStillData)
 
     if system_type:
-        if system_type not in ["conventional", "automated"]:
-            raise HTTPException(status_code=400, detail="Invalid system_type")
+        if system_type not in ["conventional", "hybrid"]:
+            raise HTTPException(status_code=400, detail="Invalid system_type. Must be 'conventional' or 'hybrid'")
         query = query.filter(SolarStillData.system_type == system_type)
 
     rows = query.order_by(SolarStillData.created_at.desc()).limit(limit).all()
@@ -334,8 +339,8 @@ def get_latest_data(system_type: str = None, db: Session = Depends(get_db)):
     query = db.query(SolarStillData)
 
     if system_type:
-        if system_type not in ["conventional", "automated"]:
-            raise HTTPException(status_code=400, detail="Invalid system_type")
+        if system_type not in ["conventional", "hybrid"]:
+            raise HTTPException(status_code=400, detail="Invalid system_type. Must be 'conventional' or 'hybrid'")
         query = query.filter(SolarStillData.system_type == system_type)
 
     row = query.order_by(SolarStillData.created_at.desc()).first()
@@ -353,8 +358,8 @@ def get_data_by_system(
         db: Session = Depends(get_db)
 ):
     """Get data for specific system type"""
-    if system_type not in ["conventional", "automated"]:
-        raise HTTPException(status_code=400, detail="Invalid system_type")
+    if system_type not in ["conventional", "hybrid"]:
+        raise HTTPException(status_code=400, detail="Invalid system_type. Must be 'conventional' or 'hybrid'")
 
     rows = db.query(SolarStillData).filter(
         SolarStillData.system_type == system_type
@@ -388,8 +393,8 @@ def get_data_range(
     )
 
     if system_type:
-        if system_type not in ["conventional", "automated"]:
-            raise HTTPException(status_code=400, detail="Invalid system_type")
+        if system_type not in ["conventional", "hybrid"]:
+            raise HTTPException(status_code=400, detail="Invalid system_type. Must be 'conventional' or 'hybrid'")
         query = query.filter(SolarStillData.system_type == system_type)
 
     rows = query.order_by(SolarStillData.created_at.desc()).all()
@@ -406,8 +411,8 @@ def get_data_range(
 @app.post("/publish")
 def publish_data(data: SolarStillDataIn, db: Session = Depends(get_db)):
     """Manually publish data directly to database (bypasses MQTT)"""
-    if data.system_type not in ["conventional", "automated"]:
-        raise HTTPException(status_code=400, detail="Invalid system_type")
+    if data.system_type not in ["conventional", "hybrid"]:
+        raise HTTPException(status_code=400, detail="Invalid system_type. Must be 'conventional' or 'hybrid'")
 
     entry = SolarStillData(
         system_type=data.system_type,
@@ -419,8 +424,8 @@ def publish_data(data: SolarStillDataIn, db: Session = Depends(get_db)):
         temp5=data.temp5,
         water_depth_cm=data.water_level.depth_cm,
         water_raw_adc=data.water_level.raw_adc,
-        pump_status=data.pump_status if data.system_type == "automated" else None,
-        time_stamp=data.time_stamp,
+        pump_status=data.pump_status if data.system_type == "hybrid" else None,
+        uptime_seconds=data.uptime_seconds,
     )
     db.add(entry)
     db.commit()
@@ -449,8 +454,8 @@ def get_statistics(db: Session = Depends(get_db)):
         SolarStillData.system_type == "conventional"
     ).scalar()
 
-    auto_count = db.query(func.count(SolarStillData.id)).filter(
-        SolarStillData.system_type == "automated"
+    hybrid_count = db.query(func.count(SolarStillData.id)).filter(
+        SolarStillData.system_type == "hybrid"
     ).scalar()
 
     avg_temp = db.query(func.avg(SolarStillData.temperature)).scalar()
@@ -468,7 +473,7 @@ def get_statistics(db: Session = Depends(get_db)):
         "total_records": total_count,
         "system_breakdown": {
             "conventional": conv_count,
-            "automated": auto_count
+            "hybrid": hybrid_count
         },
         "temperature": {
             "average": round(avg_temp, 2),
@@ -492,8 +497,8 @@ def get_statistics(db: Session = Depends(get_db)):
 @app.get("/stats/system/{system_type}")
 def get_system_statistics(system_type: str, db: Session = Depends(get_db)):
     """Get statistics for specific system type"""
-    if system_type not in ["conventional", "automated"]:
-        raise HTTPException(status_code=400, detail="Invalid system_type")
+    if system_type not in ["conventional", "hybrid"]:
+        raise HTTPException(status_code=400, detail="Invalid system_type. Must be 'conventional' or 'hybrid'")
 
     count = db.query(func.count(SolarStillData.id)).filter(
         SolarStillData.system_type == system_type
@@ -533,14 +538,14 @@ def get_system_statistics(system_type: str, db: Session = Depends(get_db)):
         }
     }
 
-    if system_type == "automated":
+    if system_type == "hybrid":
         pump_on = db.query(func.count(SolarStillData.id)).filter(
-            SolarStillData.system_type == "automated",
+            SolarStillData.system_type == "hybrid",
             SolarStillData.pump_status == "ON"
         ).scalar()
 
         pump_off = db.query(func.count(SolarStillData.id)).filter(
-            SolarStillData.system_type == "automated",
+            SolarStillData.system_type == "hybrid",
             SolarStillData.pump_status == "OFF"
         ).scalar()
 
@@ -609,11 +614,21 @@ def format_sensor_data(row):
             "depth_cm": row.water_depth_cm,
             "raw_adc": row.water_raw_adc,
         },
-        "time_stamp": row.time_stamp,
         "created_at": row.created_at.isoformat(),
     }
 
-    if row.system_type == "automated":
+    # Add uptime if available
+    if row.uptime_seconds is not None:
+        hours = row.uptime_seconds // 3600
+        minutes = (row.uptime_seconds % 3600) // 60
+        seconds = row.uptime_seconds % 60
+        data["uptime"] = {
+            "seconds": row.uptime_seconds,
+            "formatted": f"{hours}h {minutes}m {seconds}s"
+        }
+
+    # Add pump status for hybrid systems
+    if row.system_type == "hybrid":
         data["pump_status"] = row.pump_status
 
     return data
